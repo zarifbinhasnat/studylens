@@ -1,0 +1,23 @@
+{
+  "_note": "Groups for Bangladesh Civil Service (BCS) preliminary prep. Merge into your config with: studylens setup --preset examples/bcs-preliminary.json. Weights are the 200 preliminary marks; check the current PSC circular.",
+  "about": "Preparing for the BCS preliminary exam in Bangladesh.",
+  "focus_groups": ["BCS"],
+  "balance_group": "BCS",
+  "groups": [
+    {
+      "name": "BCS", "color": "orange",
+      "categories": [
+        { "name": "BCS Bangla", "weight": 35, "hint": "Bangla grammar and literature for BCS (ব্যাকরণ, সাহিত্য, লেখক ও গ্রন্থ)" },
+        { "name": "BCS English", "weight": 35, "hint": "English grammar, vocabulary and literature for BCS" },
+        { "name": "BCS Bangladesh Affairs", "weight": 30, "hint": "Bangladesh history, constitution, liberation war, economy, Bangladesh news" },
+        { "name": "BCS International Affairs", "weight": 20, "hint": "World organizations, treaties, international news and current affairs" },
+        { "name": "BCS Geography", "weight": 10, "hint": "Geography, environment and disaster management" },
+        { "name": "BCS General Science", "weight": 15, "hint": "SSC-level physics, chemistry and biology questions" },
+        { "name": "BCS ICT", "weight": 15, "hint": "Computer and ICT MCQs for BCS" },
+        { "name": "BCS Math", "weight": 15, "hint": "Mathematical reasoning MCQs" },
+        { "name": "BCS Mental Ability", "weight": 15, "hint": "Puzzles, series, analogies" },
+        { "name": "BCS Ethics", "weight": 10, "hint": "Ethics, values and good governance" }
+      ]
+    }
+  ]
+}

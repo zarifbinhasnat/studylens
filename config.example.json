@@ -1,0 +1,62 @@
+{
+  "about": "",
+  "model": "qwen3-vl:8b-instruct",
+  "ollama_url": "http://127.0.0.1:11434",
+  "keep_alive": "3m",
+
+  "sample_seconds": 60,
+  "idle_minutes": 5,
+  "screenshot_every_minutes": 5,
+  "screenshot_max_px": 1280,
+  "keep_screenshots": false,
+  "battery_ai_calls_per_run": 6,
+
+  "hide_widget_at": [],
+
+  "no_screenshot_apps": [
+    "net.whatsapp.WhatsApp",
+    "com.apple.MobileSMS",
+    "com.apple.Passwords",
+    "com.apple.keychainaccess",
+    "com.apple.systempreferences",
+    "com.apple.Settings",
+    "com.1password.1password",
+    "com.bitwarden.desktop"
+  ],
+  "app_rules": {
+    "net.whatsapp.WhatsApp": "Chat & social",
+    "com.apple.MobileSMS": "Chat & social"
+  },
+  "ignore_assertion_owners": ["caffeinate", "KeepingYouAwake", "Amphetamine", "powerd", "StudyLens"],
+
+  "checkin": { "weekdays": [7, 1], "hour": 20 },
+
+  "focus_groups": ["Study", "Projects"],
+  "balance_group": null,
+  "groups": [
+    {
+      "name": "Study", "color": "blue",
+      "categories": [
+        { "name": "Lectures & reading", "hint": "Course lectures, textbooks, slides, lecture videos" },
+        { "name": "Practice & assignments", "hint": "Problem sets, assignments, past papers, quizzes" },
+        { "name": "Exam prep", "hint": "Revision, flashcards (Anki), mock tests" }
+      ]
+    },
+    {
+      "name": "Projects", "color": "purple",
+      "categories": [
+        { "name": "Coding", "hint": "Programming on a project" },
+        { "name": "Writing & research", "hint": "Reports, papers, thesis, reading research" }
+      ]
+    },
+    {
+      "name": "Other", "color": "gray",
+      "categories": [
+        { "name": "Admin & email", "hint": "Email, forms, payments, files, calendar" },
+        { "name": "Chat & social", "hint": "Messaging and social media" },
+        { "name": "Entertainment", "hint": "Non-study videos, reels, games, sports, music" },
+        { "name": "Other", "hint": "Anything that fits nowhere else or is unclear" }
+      ]
+    }
+  ]
+}
