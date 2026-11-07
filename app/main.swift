@@ -1,6 +1,7 @@
 // StudyLens: samples what is on screen once a minute, shows a desktop widget, and asks for a weekend check-in.
 // The analyzer (Python, run by launchd) labels the samples with a local Ollama vision model.
 import AppKit
+import Charts
 import CoreLocation
 import CoreWLAN
 import ServiceManagement
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS samples(
 CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
 CREATE TABLE IF NOT EXISTS checkins(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, reply TEXT NOT NULL, applied INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS title_cache(key TEXT PRIMARY KEY, category TEXT, topic TEXT, activity TEXT, summary TEXT);
+CREATE TABLE IF NOT EXISTS user_rules(key TEXT PRIMARY KEY, category TEXT NOT NULL);
 """
 
 let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -125,6 +127,18 @@ final class DB {
         var out: [String] = []
         while sqlite3_step(st) == SQLITE_ROW {
             if let c = sqlite3_column_text(st, 0) { out.append(String(cString: c)) }
+        }
+        sqlite3_finalize(st)
+        return out
+    }
+
+    func rows(_ sql: String, _ args: [Any?] = []) -> [[String]] {
+        let st = prepare(sql, args)
+        var out: [[String]] = []
+        while sqlite3_step(st) == SQLITE_ROW {
+            out.append((0..<sqlite3_column_count(st)).map { i in
+                sqlite3_column_text(st, i).map { String(cString: $0) } ?? ""
+            })
         }
         sqlite3_finalize(st)
         return out
@@ -304,6 +318,54 @@ struct Summary: Decodable {
     let highlights: [String]
     let balance_note: String
     let checkin_text: String
+    // Screen Time-style chart data (optional so an older summary.json still loads).
+    struct Series: Decodable { let name: String; let color: String }
+    struct Point: Decodable, Identifiable { let x: String; let sort: Int; let series: String; let min: Int; var id: String { x + "|" + series } }
+    let entertainment_min: Int?
+    let series: [Series]?
+    let hourly: [Point]?
+    let daily: [Point]?
+    let today_totals: [Row]?
+    let week_totals: [Row]?
+}
+
+/// Colors for the chart, in stacking order, so every chart and legend agrees.
+func seriesScale(_ s: Summary) -> (domain: [String], range: [Color]) {
+    let series = s.series ?? []
+    return (series.map(\.name), series.map { swatch($0.color) })
+}
+
+func hourLabel(_ h: Int) -> String { h == 0 ? "12 AM" : h == 12 ? "12 PM" : h < 12 ? "\(h) AM" : "\(h - 12) PM" }
+
+/// Bars per hour of the day, stacked by subject group, like Screen Time.
+struct HourlyChart: View {
+    let summary: Summary
+    var compact = true
+
+    var body: some View {
+        let scale = seriesScale(summary)
+        let peak = Dictionary(grouping: summary.hourly ?? [], by: \.sort).values.map { $0.reduce(0) { $0 + $1.min } }.max() ?? 0
+        Chart(summary.hourly ?? []) { p in
+            BarMark(x: .value("Hour", p.sort), y: .value("Minutes", p.min), width: .fixed(compact ? 6 : 14))
+                .foregroundStyle(by: .value("Series", p.series))
+        }
+        .chartForegroundStyleScale(domain: scale.domain, range: scale.range)
+        .chartXScale(domain: -0.5...23.5)
+        .chartYScale(domain: 0...max(60, peak))
+        .chartXAxis {
+            AxisMarks(values: [0, 6, 12, 18]) { v in
+                AxisGridLine()
+                AxisValueLabel { Text(hourLabel(v.as(Int.self) ?? 0)).font(compact ? .system(size: 8) : .caption) }
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .trailing, values: [0, 30, 60]) { v in
+                AxisGridLine()
+                AxisValueLabel { Text("\(v.as(Int.self) ?? 0)m").font(compact ? .system(size: 8) : .caption) }
+            }
+        }
+        .chartLegend(.hidden)
+    }
 }
 
 final class SummaryStore: ObservableObject {
@@ -313,6 +375,7 @@ final class SummaryStore: ObservableObject {
         summary = try? JSONDecoder().decode(Summary.self, from: data)
     }
 }
+
 
 func hm(_ minutes: Int) -> String { minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m" }
 
@@ -326,6 +389,8 @@ func swatch(_ name: String) -> Color {
     case "pink": return .pink
     case "yellow": return .yellow
     case "teal": return .teal
+    case "brown": return .brown
+    case "idle": return Color.gray.opacity(0.35)
     default: return .gray
     }
 }
@@ -345,7 +410,11 @@ struct WidgetView: View {
                     Text(hm(s.focused_min)).font(.system(size: 28, weight: .semibold, design: .rounded))
                     Text("focused").foregroundStyle(.secondary)
                 }
-                Text("\(hm(s.active_min)) on screen · \(hm(s.idle_min)) idle").font(.caption).foregroundStyle(.secondary)
+                Text("\(hm(s.active_min)) on screen · \(hm(s.idle_min)) idle · \(hm(s.entertainment_min ?? 0)) entertainment")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
+                if !(s.hourly ?? []).isEmpty {
+                    HourlyChart(summary: s).frame(height: 78)
+                }
                 let top = Array(s.categories.prefix(5))
                 let most = max(top.first?.min ?? 1, 1)
                 ForEach(top) { row in
@@ -375,7 +444,7 @@ struct WidgetView: View {
             }
         }
         .padding(14)
-        .frame(width: 260, alignment: .leading)
+        .frame(width: 280, alignment: .leading)
     }
 }
 
@@ -418,14 +487,508 @@ final class WidgetPanel: NSPanel {
 
     override var canBecomeKey: Bool { false }
 
+    /// Resizes to the content and keeps the whole widget on the screen its top edge is on (the main screen if that
+    /// screen is gone), so growing content, a drag to the other monitor or unplugging it never leaves part of it off-screen.
     func fit() {
-        var origin = NSPoint(x: frame.minX, y: frame.maxY)
-        // Unplugging the second monitor can leave the widget off-screen; bring it back to the main one.
-        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }), let main = NSScreen.main?.visibleFrame {
-            origin = NSPoint(x: main.maxX - 280, y: main.maxY - 20)
-        }
+        if NSEvent.pressedMouseButtons != 0 { return }  // the user is dragging it; don't fight the drag
         let size = hosting.fittingSize
-        setFrame(NSRect(x: origin.x, y: origin.y - size.height, width: size.width, height: size.height), display: true)
+        let anchor = NSPoint(x: frame.midX, y: frame.maxY - 1)
+        let current = NSScreen.screens.first { $0.frame.contains(anchor) }
+        guard let screen = (current ?? NSScreen.main)?.visibleFrame else { return }
+        var left = frame.minX
+        var top = frame.maxY
+        if current == nil {  // its monitor was unplugged: back to the top-right of the main screen
+            left = screen.maxX - size.width - 20
+            top = screen.maxY - 20
+        }
+        left = min(max(left, screen.minX + 8), screen.maxX - size.width - 8)
+        top = min(max(top, screen.minY + size.height + 8), screen.maxY - 8)
+        setFrame(NSRect(x: left, y: top - size.height, width: size.width, height: size.height), display: true)
+    }
+
+    /// Desktop level sits under your windows like Apple's widgets; "on top" floats above them.
+    func applyLevel(onTop: Bool) {
+        level = onTop ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+    }
+}
+
+// MARK: Subjects & labels window
+
+/// Edits subjects in config.json and the labels of recent minutes, so nobody has to touch the JSON.
+final class ManageModel: ObservableObject {
+    struct Category: Identifiable { let id = UUID(); var original: String?; var name: String; var hint: String; var extra: [String: Any] }
+    struct Group: Identifiable { let id = UUID(); var original: String?; var name: String; var color: String; var categories: [Category] }
+    struct Block: Identifiable {
+        let bundle, app, title, topic, category: String
+        let minutes: Int
+        var id: String { bundle + "|" + title + "|" + topic + "|" + category }
+        /// A title that names one thing (a file, a page), unlike "Claude" or "New Tab" that cover anything.
+        var specificTitle: Bool { !title.isEmpty && title != app && !["New Tab", "Untitled", "Start Page", "Favorites"].contains(title) }
+        /// What you were doing: the window's own title when it names the thing, otherwise the topic, never just the app.
+        var name: String { specificTitle ? title : (topic.isEmpty ? app : topic) }
+        var detail: String { [app, specificTitle ? topic : "", hm(minutes)].filter { !$0.isEmpty }.joined(separator: " · ") }
+    }
+
+    @Published var groups: [Group] = []
+    @Published var blocks: [Block] = []
+    @Published var days = 1 { didSet { loadBlocks() } }
+    @Published var status = ""
+    @Published var describe = ""
+    @Published var suggesting = false
+
+    private let db: DB
+    private var config: [String: Any] = [:]
+    private let configURL = dataDir.appendingPathComponent("config.json")
+    private let palette = ["blue", "orange", "purple", "green", "pink", "teal", "yellow", "red"]
+
+    var categoryNames: [String] { groups.flatMap { $0.categories.map(\.name) } }
+
+    init(db: DB) {
+        self.db = db
+        reload()
+    }
+
+    func reload() {
+        loadConfig()
+        loadBlocks()
+        status = ""
+    }
+
+    private func loadConfig() {
+        guard let data = try? Data(contentsOf: configURL),
+              let c = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        config = c
+        groups = (c["groups"] as? [[String: Any]] ?? []).map { g in
+            Group(original: g["name"] as? String, name: g["name"] as? String ?? "", color: g["color"] as? String ?? "gray",
+                  categories: (g["categories"] as? [[String: Any]] ?? []).map { cat in
+                      Category(original: cat["name"] as? String, name: cat["name"] as? String ?? "",
+                               hint: cat["hint"] as? String ?? "", extra: cat)
+                  })
+        }
+    }
+
+    private func since() -> Int { Int(Date().timeIntervalSince1970) - days * 86400 }
+
+    func loadBlocks() {
+        blocks = db.rows("""
+            SELECT bundle, app, title, category, MAX(IFNULL(topic, '')), COUNT(*) FROM samples
+            WHERE ts >= ? AND state = 'active' AND private = 0 AND category IS NOT NULL
+              AND category NOT IN ('Idle', 'Private browsing')
+            GROUP BY bundle, title, category,
+                     CASE WHEN title IN ('', 'New Tab', 'Untitled', 'Start Page', 'Favorites') OR title = app
+                          THEN IFNULL(topic, '') ELSE '' END
+            ORDER BY MAX(ts) DESC LIMIT 150
+            """, [since()]).map {
+            Block(bundle: $0[0], app: $0[1], title: $0[2], topic: $0[4], category: $0[3], minutes: Int($0[5]) ?? 0)
+        }
+    }
+
+    /// Re-labels these minutes and remembers the choice: for the window when its title is specific, and for the
+    /// topic always, so the AI's future labels with that topic follow it. The topic also becomes an example in the prompt.
+    func relabel(_ b: Block, to category: String) {
+        guard category != b.category else { return }
+        let created = !categoryNames.contains(category)
+        if created { addSubject(category, near: b.category) }
+        if b.specificTitle {  // one window, one label: all of its minutes, whatever they were labeled before
+            db.exec("UPDATE samples SET category = ?, label_source = 'you' WHERE bundle = ? AND title = ?",
+                    [category, b.bundle, b.title])
+        } else {
+            db.exec("UPDATE samples SET category = ?, label_source = 'you' WHERE bundle = ? AND title = ? AND lower(IFNULL(topic, '')) = ?",
+                    [category, b.bundle, b.title, b.topic.lowercased()])
+        }
+        if b.specificTitle {
+            db.exec("INSERT OR REPLACE INTO user_rules(key, category) VALUES (?, ?)", [b.bundle + "|" + b.title, category])
+            db.exec("DELETE FROM title_cache WHERE key = ?", [b.bundle + "|" + b.title])
+        }
+        if !b.topic.isEmpty {
+            db.exec("INSERT OR REPLACE INTO user_rules(key, category) VALUES (?, ?)", ["topic|" + b.topic.lowercased(), category])
+            addExample(b.topic, to: category)
+        }
+        loadBlocks()
+        let what = b.name
+        status = "“\(what)” is now \(category), and will be from now on."
+            + (created ? " New subject “\(category)” added; describe it in the Subjects tab to help the AI." : "")
+        runAnalyzer("analyze")
+    }
+
+    /// A subject typed in Recent activity: goes into the same study group as the label it replaces,
+    /// or into "Added by me" when that label was outside your study groups.
+    private func addSubject(_ name: String, near current: String) {
+        var saved = config["groups"] as? [[String: Any]] ?? []
+        var focus = config["focus_groups"] as? [String] ?? []
+        let mine = "Added by me"
+        func contains(_ g: [String: Any], _ n: String) -> Bool {
+            (g["categories"] as? [[String: Any]] ?? []).contains { $0["name"] as? String == n }
+        }
+        var gi = saved.firstIndex { focus.contains($0["name"] as? String ?? "") && contains($0, current) }
+        if gi == nil { gi = saved.firstIndex { $0["name"] as? String == mine } }
+        if gi == nil {
+            let used = Set(saved.compactMap { $0["color"] as? String })
+            let at = max(0, saved.count - 1)  // before "Other"
+            saved.insert(["name": mine, "color": palette.first { !used.contains($0) } ?? "blue", "categories": []], at: at)
+            focus.append(mine)
+            gi = at
+        }
+        var cats = saved[gi!]["categories"] as? [[String: Any]] ?? []
+        cats.append(["name": name, "hint": ""])
+        saved[gi!]["categories"] = cats
+        config["groups"] = saved
+        config["focus_groups"] = focus
+        writeConfig()
+        loadConfig()
+    }
+
+    private func addExample(_ topic: String, to category: String) {
+        var saved = config["groups"] as? [[String: Any]] ?? []
+        for gi in saved.indices {
+            var cats = saved[gi]["categories"] as? [[String: Any]] ?? []
+            for ci in cats.indices where cats[ci]["name"] as? String == category {
+                var examples = cats[ci]["examples"] as? [String] ?? []
+                if !examples.contains(topic) { examples.append(topic) }
+                cats[ci]["examples"] = Array(examples.suffix(8))
+            }
+            saved[gi]["categories"] = cats
+        }
+        config["groups"] = saved
+        writeConfig()
+        // Keep unsaved edits in the Subjects tab, but carry the new examples along.
+        for gi in groups.indices {
+            for ci in groups[gi].categories.indices where groups[gi].categories[ci].original == category {
+                let fresh = saved.flatMap { $0["categories"] as? [[String: Any]] ?? [] }.first { $0["name"] as? String == category }
+                groups[gi].categories[ci].extra["examples"] = fresh?["examples"]
+            }
+        }
+    }
+
+    func addGroup() {
+        let used = Set(groups.map(\.color))
+        let color = palette.first { !used.contains($0) } ?? "blue"
+        groups.insert(Group(original: nil, name: "New group", color: color, categories: [Category(original: nil, name: "", hint: "", extra: [:])]),
+                      at: max(0, groups.count - 1))
+    }
+
+    func remove(_ id: UUID) {
+        for gi in groups.indices { groups[gi].categories.removeAll { $0.id == id } }
+    }
+
+    func suggest() {
+        let text = describe.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !suggesting else { return }
+        suggesting = true
+        status = "Asking the local AI…"
+        DispatchQueue.global().async {
+            let out = run(uvPath, ["run", "--project", analyzerDir.path, "--frozen", "--quiet", "studylens", "suggest", text])
+            DispatchQueue.main.async {
+                self.suggesting = false
+                guard let json = try? JSONSerialization.jsonObject(with: Data(out.utf8)) as? [String: String],
+                      let name = json["name"], let group = json["group"] else {
+                    self.status = "The AI couldn't suggest a subject. Is Ollama running?"
+                    return
+                }
+                let category = Category(original: nil, name: name, hint: json["hint"] ?? "", extra: [:])
+                if let gi = self.groups.firstIndex(where: { $0.name == group }) {
+                    self.groups[gi].categories.append(category)
+                } else {
+                    self.addGroup()
+                    let gi = max(0, self.groups.count - 2)
+                    self.groups[gi].name = group
+                    self.groups[gi].categories = [category]
+                }
+                self.describe = ""
+                self.status = "Added “\(name)” to \(group). Check it, then press Save."
+            }
+        }
+    }
+
+    func save() {
+        for gi in groups.indices {
+            groups[gi].name = groups[gi].name.trimmingCharacters(in: .whitespaces)
+            for ci in groups[gi].categories.indices {
+                groups[gi].categories[ci].name = groups[gi].categories[ci].name.trimmingCharacters(in: .whitespaces)
+            }
+        }
+        let names = categoryNames
+        guard !names.contains(""), Set(names).count == names.count else { status = "Every subject needs its own name."; return }
+        guard names.contains("Other") else { status = "Keep the “Other” subject; unclear time goes there."; return }
+        guard !groups.contains(where: { $0.name.isEmpty }) else { status = "Every group needs a name."; return }
+
+        // Past minutes follow renamed subjects; minutes of deleted subjects become Other.
+        let before = Set((config["groups"] as? [[String: Any]] ?? []).flatMap { ($0["categories"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String } })
+        let kept = Set(groups.flatMap { $0.categories.compactMap(\.original) })
+        for g in groups {
+            for c in g.categories {
+                guard let old = c.original, old != c.name else { continue }
+                db.exec("UPDATE samples SET category = ? WHERE category = ?", [c.name, old])
+                db.exec("UPDATE user_rules SET category = ? WHERE category = ?", [c.name, old])
+                db.exec("DELETE FROM title_cache WHERE category = ?", [old])
+            }
+        }
+        for gone in before.subtracting(kept) {
+            db.exec("UPDATE samples SET category = 'Other' WHERE category = ?", [gone])
+            db.exec("DELETE FROM user_rules WHERE category = ?", [gone])
+            db.exec("DELETE FROM title_cache WHERE category = ?", [gone])
+        }
+
+        var focus = config["focus_groups"] as? [String] ?? []
+        for g in groups {
+            if let old = g.original, old != g.name { focus = focus.map { $0 == old ? g.name : $0 } }
+            if g.original == nil && g.name != "Other" && !focus.contains(g.name) { focus.append(g.name) }
+        }
+        let live = groups.filter { !$0.categories.isEmpty }
+        config["focus_groups"] = focus.filter { f in live.contains { $0.name == f } }
+        // The weighted "balance" group (e.g. exam subjects by marks) follows a rename and is dropped with its group.
+        if var balance = config["balance_group"] as? String {
+            if let renamed = groups.first(where: { $0.original == balance }) { balance = renamed.name }
+            config["balance_group"] = live.contains { $0.name == balance } ? balance : NSNull()
+        }
+        config["groups"] = live.map { g -> [String: Any] in
+            ["name": g.name, "color": g.color, "categories": g.categories.map { c -> [String: Any] in
+                var d = c.extra
+                d["name"] = c.name
+                d["hint"] = c.hint
+                return d
+            }]
+        }
+        writeConfig()
+        loadConfig()
+        loadBlocks()
+        status = "Saved. New minutes use these subjects from now on."
+        runAnalyzer("analyze")
+    }
+
+    private func writeConfig() {
+        let backup = dataDir.appendingPathComponent("config.backup.json")
+        try? FileManager.default.removeItem(at: backup)
+        try? FileManager.default.copyItem(at: configURL, to: backup)
+        if let data = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
+            try? data.write(to: configURL, options: .atomic)
+        }
+    }
+}
+
+/// Screen Time-style overview: today by hour or the last 7 days by day, with totals per group and distraction.
+struct OverviewTab: View {
+    @ObservedObject var store: SummaryStore
+    @State private var week = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let s = store.summary, s.series != nil {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(week ? "Last 7 days" : "Today").font(.headline).foregroundStyle(.secondary)
+                        let total = (week ? s.week_totals : s.today_totals) ?? []
+                        Text(hm(total.filter { $0.name != "Idle" }.reduce(0) { $0 + $1.min })).font(.system(size: 30, weight: .semibold, design: .rounded))
+                        Text("on screen, \(hm(total.first { $0.name == "Idle" }?.min ?? 0)) idle").foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: $week) {
+                        Text("Today").tag(false)
+                        Text("Last 7 days").tag(true)
+                    }
+                    .pickerStyle(.segmented).frame(width: 220)
+                }
+                let scale = seriesScale(s)
+                if week {
+                    Chart(s.daily ?? []) { p in
+                        BarMark(x: .value("Day", p.x), y: .value("Hours", Double(p.min) / 60))
+                            .foregroundStyle(by: .value("Series", p.series))
+                    }
+                    .chartForegroundStyleScale(domain: scale.domain, range: scale.range)
+                    .chartYAxis { AxisMarks(position: .trailing) { v in AxisGridLine(); AxisValueLabel { Text("\(v.as(Double.self) ?? 0, specifier: "%.0f")h") } } }
+                    .chartLegend(.hidden)
+                    .frame(height: 240)
+                } else {
+                    HourlyChart(summary: s, compact: false).frame(height: 240)
+                }
+                Divider()
+                let rows = (week ? s.week_totals : s.today_totals) ?? []
+                let most = max(rows.map(\.min).max() ?? 1, 1)
+                ScrollView {
+                    VStack(spacing: 8) {
+                        ForEach(rows) { r in
+                            HStack(spacing: 10) {
+                                Circle().fill(swatch(r.color)).frame(width: 10, height: 10)
+                                Text(r.name).frame(width: 190, alignment: .leading)
+                                GeometryReader { g in
+                                    Capsule().fill(swatch(r.color)).frame(width: max(4, g.size.width * CGFloat(r.min) / CGFloat(most)), height: 6)
+                                        .frame(maxHeight: .infinity)
+                                }
+                                Text(hm(r.min)).monospacedDigit().foregroundStyle(.secondary).frame(width: 70, alignment: .trailing)
+                            }
+                            .frame(height: 18)
+                        }
+                    }
+                }
+            } else {
+                Text("The chart appears after the next analysis (within 10 minutes).")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding()
+    }
+}
+
+struct ManageView: View {
+    @ObservedObject var model: ManageModel
+    @ObservedObject var store: SummaryStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            TabView {
+                OverviewTab(store: store).tabItem { Text("Overview") }
+                ActivityTab(model: model).tabItem { Text("Recent activity") }
+                SubjectsTab(model: model).tabItem { Text("Subjects") }
+            }
+            if !model.status.isEmpty {
+                Text(model.status).font(.callout).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20).padding(.bottom, 12)
+            }
+        }
+        .padding(.top, 10)
+        .frame(minWidth: 780, minHeight: 560)
+    }
+}
+
+struct ActivityTab: View {
+    @ObservedObject var model: ManageModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Wrong subject? Pick the right one. StudyLens re-labels that time, uses it for that window from now on, and learns from the example.")
+                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Picker("", selection: $model.days) {
+                    Text("Last 24 hours").tag(1)
+                    Text("Last 7 days").tag(7)
+                }
+                .pickerStyle(.segmented).frame(width: 220)
+            }
+            if model.blocks.isEmpty {
+                Text("Nothing labeled yet. Labels appear about 10 minutes after you work on something.")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(model.blocks) { b in
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(b.name).lineLimit(1)
+                            Text(b.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        SubjectBox(value: b.category, options: model.categoryNames) { model.relabel(b, to: $0) }
+                            .frame(width: 240)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .padding()
+    }
+}
+
+/// Pick a subject or type one: it autocompletes from your subjects, and a name that doesn't exist yet is created.
+struct SubjectBox: NSViewRepresentable {
+    let value: String
+    let options: [String]
+    let onCommit: (String) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSComboBox {
+        let box = NSComboBox()
+        box.isEditable = true
+        box.completes = true
+        box.numberOfVisibleItems = 14
+        box.delegate = context.coordinator
+        box.target = context.coordinator
+        box.action = #selector(Coordinator.entered(_:))
+        return box
+    }
+
+    func updateNSView(_ box: NSComboBox, context: Context) {
+        context.coordinator.parent = self
+        guard box.currentEditor() == nil else { return }  // don't overwrite what the user is typing
+        box.removeAllItems()
+        box.addItems(withObjectValues: options)
+        box.stringValue = value
+    }
+
+    final class Coordinator: NSObject, NSComboBoxDelegate {
+        var parent: SubjectBox
+        init(_ parent: SubjectBox) { self.parent = parent }
+
+        @objc func entered(_ box: NSComboBox) { commit(box.stringValue) }
+
+        func comboBoxSelectionDidChange(_ note: Notification) {
+            guard let box = note.object as? NSComboBox, box.indexOfSelectedItem >= 0,
+                  let picked = box.itemObjectValue(at: box.indexOfSelectedItem) as? String else { return }
+            commit(picked)
+        }
+
+        func controlTextDidEndEditing(_ note: Notification) {
+            if let box = note.object as? NSComboBox { commit(box.stringValue) }
+        }
+
+        private func commit(_ text: String) {
+            let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Typing a different case of an existing subject means that subject.
+            let match = parent.options.first { $0.caseInsensitiveCompare(name) == .orderedSame } ?? name
+            guard !match.isEmpty, match != parent.value else { return }
+            parent.onCommit(match)
+        }
+    }
+}
+
+struct SubjectsTab: View {
+    @ObservedObject var model: ManageModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                TextField("Describe something new to track, e.g. “rickshaw battery project” or “IELTS writing”", text: $model.describe)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { model.suggest() }
+                Button(model.suggesting ? "Thinking…" : "Add with AI") { model.suggest() }
+                    .disabled(model.suggesting || model.describe.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    ForEach($model.groups) { $group in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Circle().fill(swatch(group.color)).frame(width: 10, height: 10)
+                                TextField("Group name", text: $group.name).font(.headline).textFieldStyle(.plain)
+                            }
+                            ForEach($group.categories) { $category in
+                                HStack {
+                                    TextField("Subject", text: $category.name).textFieldStyle(.roundedBorder).frame(width: 210)
+                                    TextField("What it looks like on screen: topics, books, websites, tools", text: $category.hint)
+                                        .textFieldStyle(.roundedBorder)
+                                    Button { model.remove(category.id) } label: { Image(systemName: "trash") }
+                                        .buttonStyle(.borderless)
+                                        .disabled(category.name == "Other")
+                                        .help("Delete this subject; its past minutes become Other")
+                                }
+                            }
+                            Button("+ Add subject") {
+                                group.categories.append(.init(original: nil, name: "", hint: "", extra: [:]))
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    Button("+ New group") { model.addGroup() }.buttonStyle(.borderless)
+                }
+                .padding(.vertical, 4)
+            }
+            HStack {
+                Spacer()
+                Button("Undo changes") { model.reload() }
+                Button("Save") { model.save() }.keyboardShortcut("s").buttonStyle(.borderedProminent)
+            }
+        }
+        .padding()
     }
 }
 
@@ -439,8 +1002,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var panel = WidgetPanel(store: store)
     var statusItem: NSStatusItem!
     var showWidget = UserDefaults.standard.object(forKey: "showWidget") as? Bool ?? true
+    var widgetOnTop = UserDefaults.standard.bool(forKey: "widgetOnTop")
+    lazy var manageModel = ManageModel(db: db)
+    var manageWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // A menu-bar app has no menus of its own; this Edit menu makes ⌘C/⌘V/⌘Z work in its text fields.
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem()
+        editItem.submenu = edit
+        let mainMenu = NSMenu()
+        mainMenu.addItem(NSMenuItem())
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
         if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
         // Needed only to recognise Safari private windows; until granted, Safari is treated as private.
         AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
@@ -460,6 +1040,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.maybeCheckin(force: false)
         }
         sampler.tick()
+        if CommandLine.arguments.contains("--manage") { openManage() }
+        panel.applyLevel(onTop: widgetOnTop)
+        // Plugging in or removing a monitor moves the widget back onto a screen right away.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refresh()
+        }
     }
 
     var missingPermissions: [String] {
@@ -484,16 +1070,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let place = locator.hiddenAt { menu.addItem(withTitle: "At \(place): widget hidden", action: nil, keyEquivalent: "") }
         let widget = menu.addItem(withTitle: "Show desktop widget", action: #selector(toggleWidget), keyEquivalent: "")
         widget.state = showWidget ? .on : .off
+        let onTop = menu.addItem(withTitle: "Keep widget above windows", action: #selector(toggleOnTop), keyEquivalent: "")
+        onTop.state = widgetOnTop ? .on : .off
         if sampler.paused {
             menu.addItem(withTitle: "Resume tracking", action: #selector(resume), keyEquivalent: "")
         } else {
             menu.addItem(withTitle: "Pause tracking for 1 hour", action: #selector(pause), keyEquivalent: "")
         }
+        menu.addItem(withTitle: "Subjects & labels…", action: #selector(openManage), keyEquivalent: "")
         menu.addItem(withTitle: "Weekend check-in…", action: #selector(checkinNow), keyEquivalent: "")
         menu.addItem(withTitle: "Open StudyLens folder", action: #selector(openFolder), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit StudyLens", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for item in menu.items where item.action != nil && item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
+    }
+
+    @objc func toggleOnTop() {
+        widgetOnTop.toggle()
+        UserDefaults.standard.set(widgetOnTop, forKey: "widgetOnTop")
+        panel.applyLevel(onTop: widgetOnTop)
     }
 
     @objc func toggleWidget() {
@@ -506,6 +1101,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func resume() { sampler.pausedUntil = nil }
     @objc func checkinNow() { maybeCheckin(force: true) }
     @objc func openFolder() { NSWorkspace.shared.open(dataDir) }
+
+    @objc func openManage() {
+        if manageWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 620),
+                                  styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+            window.title = "StudyLens: Subjects & labels"
+            window.contentView = NSHostingView(rootView: ManageView(model: manageModel, store: store))
+            window.isReleasedWhenClosed = false
+            window.center()
+            manageWindow = window
+        } else {
+            manageModel.reload()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        manageWindow?.makeKeyAndOrderFront(nil)
+    }
 
     /// Once per weekend (Friday or Saturday evening by default): "what were you doing or learning?"
     func maybeCheckin(force: Bool) {
@@ -561,7 +1172,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ],
         highlights: ["Algorithms · Dijkstra's shortest path (52m)", "BCS Bangla · সমাস (40m)", "Thesis · Landsat NDWI (38m)"],
         balance_note: "BCS behind this week: International Affairs, Geography",
-        checkin_text: "")
+        checkin_text: "",
+        entertainment_min: 26,
+        series: [.init(name: "University", color: "blue"), .init(name: "BCS", color: "orange"),
+                 .init(name: "Thesis", color: "purple"), .init(name: "Chat & social", color: "pink"),
+                 .init(name: "Entertainment", color: "red"), .init(name: "Idle", color: "idle")],
+        hourly: [(8, "University", 25), (9, "University", 48), (10, "BCS", 40), (10, "Chat & social", 8), (11, "BCS", 32),
+                 (11, "Idle", 12), (13, "Thesis", 35), (14, "Thesis", 31), (14, "Entertainment", 14), (16, "University", 31),
+                 (17, "Chat & social", 12), (17, "Entertainment", 12), (18, "Idle", 26)]
+            .map { Summary.Point(x: String($0.0), sort: $0.0, series: $0.1, min: $0.2) },
+        daily: [], today_totals: [], week_totals: [])
     let card = WidgetView(store: store)
         .background(RoundedRectangle(cornerRadius: 16).fill(Color(white: 0.13).opacity(0.92)))
         .padding(28)
@@ -570,6 +1190,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         .environment(\.colorScheme, .dark)
     let view = NSHostingView(rootView: card)
     view.frame = NSRect(origin: .zero, size: view.fittingSize)
+    // Charts lay out asynchronously: host the view in an offscreen window and let the run loop turn briefly.
+    let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: view.frame.width, height: view.frame.height),
+                          styleMask: .borderless, backing: .buffered, defer: false)
+    window.contentView = view
+    window.orderFrontRegardless()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.6))
     view.layoutSubtreeIfNeeded()
     guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { exit(1) }
     view.cacheDisplay(in: view.bounds, to: rep)
