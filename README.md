@@ -12,6 +12,8 @@ you actually learned. Tell it your courses or exam subjects in your own words; i
 - 🧠 **Understands content, not just apps.** A YouTube lecture on eigenvalues counts as Linear Algebra; a YouTube music video does not.
 - 🗣️ **You describe, it organises.** `studylens setup` turns "CSE undergrad, Algorithms and Linear Algebra, preparing for BCS" into categories.
 - ⚖️ **Balance check.** Give exam subjects weights (e.g. marks) and the widget tells you which ones are falling behind.
+- 📊 **Screen Time-style charts.** Hourly bars for today and daily bars for the week, by subject group, with idle time and entertainment as their own colors.
+- ✏️ **Fix a label in one click, and it sticks.** Type or pick the right subject; StudyLens re-labels that time, uses it from then on, and learns from the example. One thing always gets one label.
 - 😴 **Honest idle time.** 5 minutes without input counts as idle, unless a video or call is playing.
 - 🕶️ **Private windows stay private.** Chrome incognito and Safari private windows are never captured.
 - 🖥️ **Multi-monitor aware**, hides the widget at places you choose (e.g. campus), weekend check-in, optional Notion sync.
@@ -65,9 +67,19 @@ your answer to re-label time it couldn't place.
 
 ## Everyday use
 
-- **Menu bar (book icon):** show/hide the widget, pause tracking for an hour, weekend check-in, open the data folder.
-- **Report in the terminal:** `studylens report`
-- **Settings:** `~/Library/Application Support/StudyLens/config.json`
+**Menu bar (book icon) → Subjects & labels…** opens the app window:
+
+- **Overview**: today by hour or the last 7 days by day, stacked by subject group, with idle and entertainment, plus totals.
+- **Recent activity**: everything you did, named by what it was (the page or file title, or the topic of a chat), each with a
+  subject box. Pick or type a subject; a new name creates that subject. The choice applies to all of that thing's
+  minutes and to every future minute of it, and the topic becomes an example the AI learns from.
+- **Subjects**: add, rename or delete subjects and groups, edit how each looks on screen, or describe something new
+  and press **Add with AI**.
+
+The menu also has: show/hide the widget, keep it above windows, pause tracking for an hour, weekend check-in, open the
+data folder. In the terminal, `studylens report` prints today's summary.
+
+Advanced settings live in `~/Library/Application Support/StudyLens/config.json`:
 
 | Setting | Default | Meaning |
 |---|---|---|
