@@ -420,8 +420,11 @@ def sync_notion(cfg, db, summary):
         state = json.loads(NOTION_STATE.read_text())
         state["last_day"] = f"{today:%Y-%m-%d}"
         NOTION_STATE.write_text(json.dumps(state, indent=1))
+        return True
     except Exception as e:
-        print(f"{datetime.now():%H:%M} Notion sync failed, will retry: {e}", file=sys.stderr)
+        hint = " (is your integration added to the page under ⋯ → Connections?)" if "404" in str(e) else ""
+        print(f"{datetime.now():%H:%M} Notion sync failed, will retry: {e}{hint}", file=sys.stderr)
+        return False
 
 
 def save_config(cfg):
@@ -597,7 +600,8 @@ def main():
     elif command == "notion":
         if "notion" not in cfg or not notion_token():
             sys.exit("Notion is not set up yet: see the README, then run  studylens notion-init PAGE_URL")
-        sync_notion(cfg, db, write_summary(cfg, db))
+        if not sync_notion(cfg, db, write_summary(cfg, db)):
+            sys.exit(1)
         print("Synced today to Notion.")
     elif command == "notion-init" and len(sys.argv) > 2:
         notion_init(cfg, sys.argv[2])
