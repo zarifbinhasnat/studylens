@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.zarifbinhasnat.studylens</string>
+	<key>CFBundleName</key>
+	<string>StudyLens</string>
+	<key>CFBundleExecutable</key>
+	<string>StudyLens</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSLocationUsageDescription</key>
+	<string>StudyLens checks only whether you are at a place where you asked it to hide the widget. Your location is never stored.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>StudyLens checks only whether you are at a place where you asked it to hide the widget. Your location is never stored.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>StudyLens asks Chrome and Safari whether the front window is incognito or private, so it can skip screenshots there.</string>
+</dict>
+</plist>
