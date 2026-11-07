@@ -341,6 +341,7 @@ func hourLabel(_ h: Int) -> String { h == 0 ? "12 AM" : h == 12 ? "12 PM" : h < 
 struct HourlyChart: View {
     let summary: Summary
     var compact = true
+    var highlight: String? = nil
 
     var body: some View {
         let scale = seriesScale(summary)
@@ -348,6 +349,7 @@ struct HourlyChart: View {
         Chart(summary.hourly ?? []) { p in
             BarMark(x: .value("Hour", p.sort), y: .value("Minutes", p.min), width: .fixed(compact ? 6 : 14))
                 .foregroundStyle(by: .value("Series", p.series))
+                .opacity(highlight == nil || highlight == p.series ? 1 : 0.18)
         }
         .chartForegroundStyleScale(domain: scale.domain, range: scale.range)
         .chartXScale(domain: -0.5...23.5)
@@ -770,6 +772,7 @@ final class ManageModel: ObservableObject {
 struct OverviewTab: View {
     @ObservedObject var store: SummaryStore
     @State private var week = false
+    @State private var hovered: String?  // a breakdown row under the pointer; the charts spotlight it
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -793,13 +796,14 @@ struct OverviewTab: View {
                     Chart(s.daily ?? []) { p in
                         BarMark(x: .value("Day", p.x), y: .value("Hours", Double(p.min) / 60))
                             .foregroundStyle(by: .value("Series", p.series))
+                            .opacity(hovered == nil || hovered == p.series ? 1 : 0.18)
                     }
                     .chartForegroundStyleScale(domain: scale.domain, range: scale.range)
                     .chartYAxis { AxisMarks(position: .trailing) { v in AxisGridLine(); AxisValueLabel { Text("\(v.as(Double.self) ?? 0, specifier: "%.0f")h") } } }
                     .chartLegend(.hidden)
                     .frame(height: 240)
                 } else {
-                    HourlyChart(summary: s, compact: false).frame(height: 240)
+                    HourlyChart(summary: s, compact: false, highlight: hovered).frame(height: 240)
                 }
                 Divider()
                 let rows = (week ? s.week_totals : s.today_totals) ?? []
@@ -807,16 +811,25 @@ struct OverviewTab: View {
                 ScrollView {
                     VStack(spacing: 8) {
                         ForEach(rows) { r in
+                            let on = hovered == r.name
                             HStack(spacing: 10) {
-                                Circle().fill(swatch(r.color)).frame(width: 10, height: 10)
-                                Text(r.name).frame(width: 190, alignment: .leading)
+                                Circle().fill(swatch(r.color)).frame(width: on ? 12 : 10, height: on ? 12 : 10)
+                                Text(r.name).fontWeight(on ? .semibold : .regular).frame(width: 190, alignment: .leading)
                                 GeometryReader { g in
-                                    Capsule().fill(swatch(r.color)).frame(width: max(4, g.size.width * CGFloat(r.min) / CGFloat(most)), height: 6)
+                                    Capsule().fill(swatch(r.color)).frame(width: max(4, g.size.width * CGFloat(r.min) / CGFloat(most)), height: on ? 9 : 6)
                                         .frame(maxHeight: .infinity)
                                 }
-                                Text(hm(r.min)).monospacedDigit().foregroundStyle(.secondary).frame(width: 70, alignment: .trailing)
+                                Text(hm(r.min)).monospacedDigit().foregroundStyle(on ? .primary : .secondary).frame(width: 70, alignment: .trailing)
                             }
                             .frame(height: 18)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(on ? swatch(r.color).opacity(0.15) : .clear))
+                            .scaleEffect(on ? 1.025 : 1, anchor: .leading)
+                            .opacity(hovered == nil || on ? 1 : 0.55)
+                            .contentShape(Rectangle())
+                            .onHover { inside in
+                                withAnimation(.easeOut(duration: 0.15)) { hovered = inside ? r.name : (hovered == r.name ? nil : hovered) }
+                            }
                         }
                     }
                 }

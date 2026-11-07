@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-11-07
+
+- Overview: hovering a subject in the breakdown enlarges it and spotlights its bars in the chart.
+
 ## 0.2.0 — 2026-11-07
 
 - **Subjects & labels window** (menu bar → Subjects & labels…): Overview charts, Recent activity with a type-or-pick
