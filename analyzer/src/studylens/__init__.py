@@ -10,6 +10,7 @@ desktop widget shows, and applies the weekend check-in. Everything stays on this
     studylens report                print today and the last 7 days
     studylens notion-init PAGE_URL  create the Daily and Weekly tables under a Notion page you shared
     studylens notion                push today to Notion now
+    studylens suggest TEXT          suggest a subject (group, name, hint) for something described in words, as JSON
 
 Notion sync is optional: it runs when config.json has a "notion" section and the integration token is in the
 login Keychain (service "studylens-notion"). Only totals and topics are sent, never titles or screenshots.
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS samples(
 CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
 CREATE TABLE IF NOT EXISTS checkins(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, reply TEXT NOT NULL, applied INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS title_cache(key TEXT PRIMARY KEY, category TEXT, topic TEXT, activity TEXT, summary TEXT);
+CREATE TABLE IF NOT EXISTS user_rules(key TEXT PRIMARY KEY, category TEXT NOT NULL);
 """
 
 ACTIVITIES = ["reading", "watching", "practicing", "writing", "coding", "chatting", "browsing", "other"]
@@ -57,9 +59,10 @@ def connect():
 
 
 def categories(cfg):
-    """Category name -> {group, color, hint, weight}, in config order."""
+    """Category name -> {group, color, hint, weight, examples}, in config order."""
     return {
-        c["name"]: {"group": g["name"], "color": g["color"], "hint": c.get("hint", ""), "weight": c.get("weight")}
+        c["name"]: {"group": g["name"], "color": g["color"], "hint": c.get("hint", ""), "weight": c.get("weight"),
+                    "examples": c.get("examples", [])}
         for g in cfg["groups"]
         for c in g["categories"]
     }
@@ -88,7 +91,11 @@ def ollama(cfg, messages, schema):
 
 
 def category_list(cats):
-    return "\n".join(f"- {n}: {c['hint']}" if c["hint"] else f"- {n}" for n, c in cats.items())
+    def line(n, c):
+        text = f"- {n}: {c['hint']}" if c["hint"] else f"- {n}"
+        # Examples come from labels the user corrected in the Subjects & labels window.
+        return text + (f" (for example: {', '.join(c['examples'])})" if c["examples"] else "")
+    return "\n".join(line(n, c) for n, c in cats.items())
 
 
 def classify(cfg, cats, app, title, shot):
@@ -124,6 +131,48 @@ def classify(cfg, cats, app, title, shot):
     return out
 
 
+# Titles that say nothing about the content: the app's own name ("Claude"), or browser placeholders.
+GENERIC_TITLES = {"", "New Tab", "Untitled", "Start Page", "Favorites"}
+
+
+def specific(r):
+    """A window whose title names one thing (an article, a PDF, a page); one thing gets one label."""
+    return r["title"] not in GENERIC_TITLES and r["title"] != r["app"]
+
+
+def known_label(db, r):
+    """The label this specific window already has: the one you chose, otherwise the latest."""
+    return db.execute(
+        "SELECT category, topic, activity, summary FROM samples WHERE bundle = ? AND title = ? AND ts < ?"
+        f" AND label_source IN {LABELED} AND category NOT IN (?, ?)"
+        " ORDER BY label_source = 'you' DESC, ts DESC LIMIT 1",
+        (r["bundle"], r["title"], r["ts"], IDLE, PRIVATE),
+    ).fetchone()
+
+
+def unify_labels(db, since):
+    """One thing, one label: every specific window, and every topic inside a general window like Claude,
+    ends up with a single subject: the one you chose, otherwise the one most of its minutes got."""
+    rows = db.execute(
+        "SELECT id, app, bundle, title, topic, category, label_source FROM samples WHERE ts >= ? AND state = 'active'"
+        " AND label_source IS NOT NULL AND category NOT IN (?, ?) ORDER BY ts",
+        (since, IDLE, PRIVATE),
+    ).fetchall()
+    things = defaultdict(list)
+    for r in rows:
+        key = (r["bundle"], r["title"]) if specific(r) else (r["bundle"], "topic:" + (r["topic"] or "").lower())
+        if key[1] != "topic:":
+            things[key].append(r)
+    for rs in things.values():
+        counts = Counter(r["category"] for r in rs)
+        if len(counts) < 2:
+            continue
+        chosen = [r["category"] for r in rs if r["label_source"] == "you"]
+        winner = chosen[-1] if chosen else counts.most_common(1)[0][0]
+        db.executemany("UPDATE samples SET category = ? WHERE id = ?", [(winner, r["id"]) for r in rs if r["category"] != winner])
+    db.commit()
+
+
 def inherited(db, r):
     """Same window as a minute that was already labeled in the last 30 minutes."""
     return db.execute(
@@ -148,8 +197,21 @@ def analyze(cfg, db):
             label = (PRIVATE, "", "browsing", "", "rule")
         elif r["bundle"] in cfg["app_rules"]:
             label = (cfg["app_rules"][r["bundle"]], "", "chatting", "", "rule")
+        elif rule := db.execute("SELECT category FROM user_rules WHERE key = ?", (f"{r['bundle']}|{r['title']}",)).fetchone():
+            # A label the user chose for this window always wins; reuse the last topic seen for it.
+            seen = db.execute(
+                "SELECT topic, activity, summary FROM samples WHERE bundle = ? AND title = ? AND topic != '' ORDER BY ts DESC LIMIT 1",
+                (r["bundle"], r["title"]),
+            ).fetchone()
+            label = (rule[0], *(seen or ("", "other", "")), "you")
+        elif specific(r) and (prev := known_label(db, r)):
+            label = (*prev, "inherit")  # already labeled: don't ask the model again and risk a second answer
         elif not shot and (prev := inherited(db, r)):
             label = (*prev, "inherit")
+        elif not shot and (hit := db.execute(
+            "SELECT category, topic, activity, summary FROM title_cache WHERE key = ?", (f"{r['bundle']}|{r['title']}",)
+        ).fetchone()):
+            label = (*hit, "cache")
         elif not shot and (hit := db.execute(
             "SELECT category, topic, activity, summary FROM title_cache WHERE key = ?", (f"{r['bundle']}|{r['title']}",)
         ).fetchone()):
@@ -164,6 +226,16 @@ def analyze(cfg, db):
                 break
             calls += 1
             label = (out["category"], out["topic"].strip(), out["activity"], out["summary"].strip(), "ai")
+            # A subject the user chose for this topic in the Subjects & labels window overrides the model.
+            if chosen := db.execute("SELECT category FROM user_rules WHERE key = ?", ("topic|" + label[1].lower(),)).fetchone():
+                label = (chosen[0], *label[1:4], "you")
+            # The same topic seen before keeps its subject, so one thing never gets two labels.
+            elif seen := db.execute(
+                f"SELECT category FROM samples WHERE bundle = ? AND lower(topic) = ? AND label_source IN {LABELED}"
+                " AND category NOT IN (?, ?) ORDER BY label_source = 'you' DESC, ts DESC LIMIT 1",
+                (r["bundle"], label[1].lower(), IDLE, PRIVATE),
+            ).fetchone():
+                label = (seen[0], *label[1:])
             if not shot:
                 db.execute(
                     "INSERT OR REPLACE INTO title_cache VALUES (?, ?, ?, ?, ?)",
@@ -177,6 +249,7 @@ def analyze(cfg, db):
         db.commit()
         if shot and not keep:
             Path(shot).unlink(missing_ok=True)
+    unify_labels(db, int(time.time()) - 30 * 86400)
     # Screenshots never outlive two days, whatever happened to the analyzer.
     for f in (DATA / "shots").glob("*.jpg"):
         if not cfg["keep_screenshots"] and f.stat().st_mtime < time.time() - 2 * 86400:
@@ -203,6 +276,64 @@ def unclear_blocks(rows):
 
 def hm(m):
     return f"{m // 60}h {m % 60}m" if m >= 60 else f"{m}m"
+
+
+# Colors for everything outside the focus groups, so the chart's non-study slices are told apart.
+OTHER_COLORS = {"Entertainment": "red", "Chat & social": "pink", "Coding & tools": "teal", "Admin & email": "yellow",
+                "Private": "brown", "Not labeled yet": "idle", IDLE: "idle"}
+
+
+def chart_data(cfg, cats, week, now):
+    """Screen Time-style series: focus groups by their color, the rest by category, plus idle time."""
+    focus = cfg["focus_groups"]
+
+    def series(r):
+        if r["state"] == "idle":
+            name = IDLE
+        elif r["category"] is None:
+            name = "Not labeled yet"
+        elif r["category"] not in cats:
+            name = "Private" if r["category"] == PRIVATE else "Other"
+        elif cats[r["category"]]["group"] in focus:
+            return cats[r["category"]]["group"], cats[r["category"]]["color"]
+        else:
+            name = r["category"]
+        return name, OTHER_COLORS.get(name, "gray")
+
+    colors = {}
+    hourly, daily, today_totals, week_totals = Counter(), Counter(), Counter(), Counter()
+    day_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    for r in week:
+        name, color = series(r)
+        colors[name] = color
+        day = datetime.fromtimestamp(r["ts"])
+        daily[(day.strftime("%Y-%m-%d"), name)] += 1
+        week_totals[name] += 1
+        if r["ts"] >= day_start:
+            hourly[(day.hour, name)] += 1
+            today_totals[name] += 1
+
+    # Stack order: focus groups first, distractions next, idle on top.
+    rank = {g: i for i, g in enumerate(focus)}
+    order = sorted(colors, key=lambda n: (rank.get(n, len(focus) + (2 if n == IDLE else 1)), n))
+    days = [(now - timedelta(days=d)).strftime("%Y-%m-%d") for d in range(6, -1, -1)]
+
+    def totals(counter):  # biggest first, like Screen Time
+        return [{"name": n, "color": colors[n], "min": minutes(cfg, k)} for n, k in counter.most_common() if k]
+
+    return {
+        "series": [{"name": n, "color": colors[n]} for n in order],
+        "hourly": [
+            {"x": str(h), "sort": h, "series": n, "min": minutes(cfg, hourly[(h, n)])}
+            for h in range(24) for n in order if hourly[(h, n)]
+        ],
+        "daily": [
+            {"x": datetime.strptime(d, "%Y-%m-%d").strftime("%a"), "sort": i, "series": n, "min": minutes(cfg, daily[(d, n)])}
+            for i, d in enumerate(days) for n in order if daily[(d, n)]
+        ],
+        "today_totals": totals(today_totals),
+        "week_totals": totals(week_totals),
+    }
 
 
 def write_summary(cfg, db):
@@ -258,6 +389,8 @@ def write_summary(cfg, db):
         "highlights": [f"{c.removeprefix('Course: ')} · {t} ({hm(minutes(cfg, n))})" for (c, t), n in topics.most_common(3)],
         "balance_note": balance_note,
         "checkin_text": "\n".join(lines),
+        "entertainment_min": minutes(cfg, by_cat.get("Entertainment", 0)),
+        **chart_data(cfg, cats, week, now),
     }
     tmp = DATA / "summary.json.tmp"
     tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=1))
@@ -591,6 +724,27 @@ def report(cfg, db):
     print(s["checkin_text"])
 
 
+def suggest(cfg, text):
+    cats = categories(cfg)
+    schema = {
+        "type": "object",
+        "properties": {"group": {"type": "string"}, "name": {"type": "string"}, "hint": {"type": "string"}},
+        "required": ["group", "name", "hint"],
+    }
+    groups = "\n".join(
+        f"- Group \"{g['name']}\" with subjects: {', '.join(c['name'] for c in g['categories'])}" for g in cfg["groups"]
+    )
+    prompt = (
+        f"A study tracker sorts subjects into groups:\n{groups}\n\n"
+        f"The user wants to start tracking: \"{text}\"\n\n"
+        "Return one new subject. name: at most 4 words and not an existing subject. group: the name of one of the "
+        "groups above (a group, never a subject) if it fits, otherwise a short new group name; use 'Other' only if "
+        "it is neither study nor work. hint: what it looks like on screen (topics, file or book names, websites, "
+        "tools) so it can be recognised from a screenshot."
+    )
+    print(json.dumps(ollama(cfg, [{"role": "user", "content": prompt}], schema), ensure_ascii=False))
+
+
 def main():
     command = sys.argv[1] if len(sys.argv) > 1 else "analyze"
     cfg, db = load_config(), connect()
@@ -607,6 +761,8 @@ def main():
         notion_init(cfg, sys.argv[2])
     elif command == "setup":
         setup(cfg, sys.argv[2:])
+    elif command == "suggest" and len(sys.argv) > 2:
+        suggest(cfg, " ".join(sys.argv[2:]))
     elif command == "relabel":
         relabel(cfg, db)
     elif command == "report":
