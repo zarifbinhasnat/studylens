@@ -112,7 +112,9 @@ cat > "$AGENT" <<PLIST
 </plist>
 PLIST
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$AGENT"
+# bootout returns before the old job is fully gone, so give bootstrap a moment and one retry.
+sleep 1
+launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null || { sleep 3; launchctl bootstrap "gui/$(id -u)" "$AGENT"; }
 
 open "$APP"
 step "StudyLens is running (book icon in the menu bar)."
