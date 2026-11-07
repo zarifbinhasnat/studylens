@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 — 2026-11-07
+
+- `studylens setup` keeps all courses in one group instead of making a group per course.
+
 ## 0.1.0 — 2026-11-07
 
 First public release.
